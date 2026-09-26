@@ -1,270 +1,270 @@
 """Color base."""
-from abc import ABCMeta
-from .. import util
-from . import _parse
+from __future__ import annotations
+from abc import ABCMeta, abstractmethod
+from ..channels import Channel
+from ..css import serialize
+from ..types import VectorLike, Vector, Plugin
+from .. import deprecate
+from typing import Any, TYPE_CHECKING, Callable, Sequence
+import math
 
-# Technically this form can handle any number of channels as long as any
-# extra are thrown away. We only support 6 currently. If we ever support
-# colors with more channels, we can bump this.
-RE_DEFAULT_MATCH = r"""(?xi)
-color\(\s*
-(?:({{color_space}})\s+)?
-((?:{percent}|{float})(?:{space}(?:{percent}|{float})){{{{,{{channels:d}}}}}}(?:{slash}(?:{percent}|{float}))?)
-\s*\)
-""".format(
-    **_parse.COLOR_PARTS
-)
+if TYPE_CHECKING:  # pragma: no cover
+    from ..color import Color
 
-WHITES = {
-    "A": [1.09850, 1.00000, 0.35585],
-    "B": [0.99072, 1.00000, 0.85223],
-    "C": [0.98074, 1.00000, 1.18232],
-    "D50": [0.96422, 1.00000, 0.82521],
-    "D55": [0.95682, 1.00000, 0.92149],
-    "D65": [0.95047, 1.00000, 1.08883],
-    "D75": [0.94972, 1.00000, 1.22638],
-    "E": [1.00000, 1.00000, 1.00000],
-    "F2": [0.99186, 1.00000, 0.67393],
-    "F7": [0.95041, 1.00000, 1.08747],
-    "F11": [1.00962, 1.00000, 0.64350]
+__deprecated__ = {
+    "Regular": "Prism"
 }
 
 
-class Angle(float):
-    """Angle type."""
+def __getattr__(name: str) -> Any:  # pragma: no cover
+    """Warn for deprecated attributes."""
+
+    deprecated = __deprecated__.get(name)
+    if deprecated:
+        deprecate.warn_deprecated(f"'{name}' is deprecated. Use '{deprecated}' instead.", stacklevel=3)
+        return globals()[deprecated]
+    raise AttributeError(f"module '{__name__}' has no attribute '{name}'")
 
 
-class Percent(float):
-    """Percent type."""
+class Prism:
+    """Prism is a 3D rectangular prism."""
 
 
-class OptionalPercent(float):
-    """Optional percent type."""
-
-
-class GamutBound(tuple):
-    """Bounded gamut value."""
-
-
-class GamutUnbound(tuple):
-    """Unbounded gamut value."""
+class RGBish(Prism):
+    """RGB-ish space."""
 
 
 class Cylindrical:
     """Cylindrical space."""
 
-    def hue_name(self):
+    get_channel_index: Callable[[str], int]
+
+    def radial_name(self) -> str:
+        """Radial name."""
+
+        return "s"
+
+    def hue_name(self) -> str:
         """Hue channel name."""
 
-        return "hue"
+        return "h"
+
+    def hue_index(self) -> int:  # pragma: no cover
+        """Get hue index."""
+
+        return self.get_channel_index(self.hue_name())
+
+    def radial_index(self) -> int:  # pragma: no cover
+        """Get radial index."""
+
+        return self.get_channel_index(self.radial_name())
 
 
-class Space(
-    metaclass=ABCMeta
-):
+class Luminant:
+    """A space that contains luminance or luminance-like component."""
+
+    get_channel_index: Callable[[str], int]
+
+    def lightness_name(self) -> str:
+        """Lightness name."""
+
+        return "l"
+
+    def lightness_index(self) -> int:
+        """Get lightness index."""
+
+        return self.get_channel_index(self.lightness_name())
+
+
+class HSLish(Luminant, Cylindrical):
+    """HSL-ish space."""
+
+
+class HSVish(Luminant, Cylindrical):
+    """HSV-ish space."""
+
+
+class HWBish(Cylindrical):
+    """HWB-ish space."""
+
+    def radial_name(self) -> str:
+        """Radial name."""
+
+        return "w"
+
+
+class Labish(Luminant, Prism):
+    """Lab-ish color spaces."""
+
+
+class LChish(Luminant, Cylindrical):
+    """LCh-ish color spaces."""
+
+    def radial_name(self) -> str:
+        """Radial name."""
+
+        return "c"
+
+
+alpha_channel = Channel('alpha', 0.0, 1.0, bound=True, limit=(0.0, 1.0))
+
+
+class SpaceMeta(ABCMeta):
+    """Ensure on subclass that the subclass has new instances of mappings."""
+
+    def __init__(cls, name: str, bases: tuple[object, ...], clsdict: dict[str, Any]) -> None:
+        """Copy mappings on subclass."""
+
+        if len(cls.mro()) > 2:
+            cls.CHANNEL_ALIASES = cls.CHANNEL_ALIASES.copy()  # type: dict[str, str]
+
+
+class Space(Plugin, metaclass=SpaceMeta):
     """Base color space object."""
 
+    BASE = ""  # type: str
     # Color space name
-    SPACE = ""
+    NAME = ""
     # Serialized name
-    SERIALIZE = None
-    # Number of channels
-    NUM_COLOR_CHANNELS = 3
+    SERIALIZE = ()  # type: tuple[str, ...]
     # Channel names
-    CHANNEL_NAMES = ("alpha",)
-    # For matching the default form of `color(space coords+ / alpha)`.
-    # Classes should define this if they want to use the default match.
-    DEFAULT_MATCH = ""
-    # Match pattern variable for classes to override so we can also
-    # maintain the default and other alternatives.
-    MATCH = ""
-    # Should this color also be checked in a different color space? Only when set to a string (specifying a color space)
-    # will the default gamut checking also check the specified space as well as the current.
+    CHANNELS = ()  # type: tuple[Channel, ...]
+    # Channel aliases
+    CHANNEL_ALIASES = {}  # type: dict[str, str]
+    # Enable or disable default color format parsing and serialization.
+    COLOR_FORMAT = True
+    # Some color spaces are a transform of a specific RGB color space gamut, e.g. HSL has a gamut of sRGB.
+    # When testing or gamut mapping a color within the current color space's gamut, `GAMUT_CHECK` will
+    # declare which space must be used as reference if anything other than the current space is required.
     #
-    # Gamut checking:
-    #   The specified color space will be checked first followed by the original. Assuming the parent color space fits,
-    #   the original should fit as well, but there are some cases when a parent color space that is slightly out of
-    #   gamut, when evaluated with a threshold, may appear to be in gamut enough, but when checking the original color
-    #   space, the values can be greatly out of specification (looking at you HSL).
-    GAMUT_CHECK = None
+    # Specifically, when testing if a color is in gamut, both the origin space and the specified gamut
+    # space will be checked as sometimes a color is within the threshold of being "close enough" to the gamut,
+    # but the color can still be far outside the origin space's coordinates. Checking both ensures sane values
+    # that are also close enough to the gamut.
+    #
+    # When actually gamut mapping, only the gamut space is used, if none is specified, the origin space is used.
+    GAMUT_CHECK = None  # type: str | None
+    # `CLIP_SPACE` forces a different space to be used for clipping than what is specified by `GAMUT_CHECK`.
+    # This is used in cases like HSL where the `GAMUT_CHECK` space is sRGB, but we want to clip in HSL as it
+    # is still reasonable and faster.
+    CLIP_SPACE = None  # type: str | None
     # White point
-    WHITE = "D50"
+    WHITE = (0.0, 0.0)
+    # What is the color space's dynamic range
+    DYNAMIC_RANGE = 'sdr'
+    # Is the space subtractive
+    SUBTRACTIVE = False
 
-    def __init__(self, color, alpha=None):
+    def __init__(self, **kwargs: Any) -> None:
         """Initialize."""
 
-        self._alpha = util.NaN
-        self._coords = [util.NaN] * self.NUM_COLOR_CHANNELS
+        self.channels = (*self.CHANNELS, alpha_channel)
+        self._chan_index = {c: e for e, c in enumerate(self.channels)}  # type: dict[str, int]
+        self._color_ids = (self.NAME,) if not self.SERIALIZE else self.SERIALIZE
+        self._percents = ([True] * (len(self.channels) - 1)) + [False]
+        self._polar = isinstance(self, Cylindrical)
 
-        if isinstance(color, Space):
-            for index, channel in enumerate(color.coords()):
-                self.set(self.CHANNEL_NAMES[index], channel)
-            self.alpha = color.alpha
-        elif isinstance(color, (list, tuple)):
-            if len(color) != self.NUM_COLOR_CHANNELS:  # pragma: no cover
-                # Only likely to happen with direct usage internally.
-                raise ValueError(
-                    "A list of channel values should be at a minimum of {}.".format(self.NUM_COLOR_CHANNELS)
-                )
-            for index in range(self.NUM_COLOR_CHANNELS):
-                self.set(self.CHANNEL_NAMES[index], color[index])
-            self.alpha = 1.0 if alpha is None else alpha
-        else:  # pragma: no cover
-            # Only likely to happen with direct usage internally.
-            raise TypeError("Unexpected type '{}' received".format(type(color)))
+    def names(self) -> tuple[Channel, ...]:
+        """Returns component names in a logical order specific to their color space type."""
 
-    def __repr__(self):
-        """Representation."""
+        return self.channels[:-1]
 
-        gamut = self.RANGE
-        values = []
-        for i, coord in enumerate(util.no_nan(self.coords())):
-            value = util.fmt_float(coord, util.DEF_PREC)
-            if isinstance(gamut[i][0], Percent):
-                value += '%'
-            values.append(value)
+    def indexes(self) -> list[int]:
+        """Returns component indexes in a logical order specific to their color space type."""
 
-        return 'color({} {} / {})'.format(
-            self._serialize()[0],
-            ' '.join(values),
-            util.fmt_float(util.no_nan(self.alpha), util.DEF_PREC)
-        )
+        return [self.get_channel_index(name) for name in self.names()]
 
-    __str__ = __repr__
+    def is_polar(self) -> bool:
+        """Return if the space is polar."""
 
-    def _handle_input(self, value):
-        """Handle numerical input."""
+        return self._polar
 
-        if not util.is_number(value):
-            raise TypeError("Value should be a number not type '{}'".format(type(value)))
-        return float(value) if not util.is_nan(value) else value
+    def linear(self) -> str:
+        """Will return the name of the space which is the linear version of itself (if available)."""
 
-    def coords(self):
-        """Coordinates."""
+        return ''
 
-        return self._coords[:]
+    def get_channel_index(self, name: str) -> int:
+        """Get channel index."""
 
-    @classmethod
-    def space(cls):
-        """Get the color space."""
+        idx = self._chan_index.get(self.CHANNEL_ALIASES.get(name, name))
+        return int(name) if idx is None else idx
 
-        return cls.SPACE
+    def resolve_channel(self, index: int, coords: Vector) -> float:
+        """Resolve channels."""
 
-    @classmethod
-    def _serialize(cls):
+        value = coords[index]
+        return self.channels[index].nans if math.isnan(value) else value
+
+    def _serialize(self) -> tuple[str, ...]:
         """Get the serialized name."""
 
-        return (cls.space(),) if cls.SERIALIZE is None else cls.SERIALIZE
+        return self._color_ids
+
+    def normalize(self, coords: Vector) -> Vector:
+        """
+        Normalize coordinates.
+
+        This allows a color space to normalize valid, but non-standard coordinates.
+        An example is cylindrical spaces with negative chroma/saturation. Such models
+        often have a valid, positive chroma/saturation and hue configuration that
+        matches the same color.
+        """
+
+        return coords
+
+    def is_achromatic(self, coords: Vector) -> bool | None:  # pragma: no cover
+        """Check if color is achromatic."""
+
+        return None
 
     @classmethod
-    def white(cls):
+    def white(cls) -> VectorLike:
         """Get the white color for this color space."""
 
-        return WHITES[cls.WHITE]
+        return cls.WHITE
 
-    @property
-    def alpha(self):
-        """Alpha channel."""
+    @abstractmethod
+    def to_base(self, coords: Vector) -> Vector:  # pragma: no cover
+        """To base color."""
 
-        return self._alpha
-
-    @alpha.setter
-    def alpha(self, value):
-        """Adjust alpha."""
-
-        self._alpha = util.clamp(self._handle_input(value), 0.0, 1.0)
-
-    def set(self, name, value):  # noqa: A003
-        """Set the given channel."""
-
-        if name not in self.CHANNEL_NAMES:
-            raise ValueError("'{}' is an invalid channel name".format(name))
-
-        setattr(self, name, value)
-        return self
-
-    def get(self, name):
-        """Get the given channel's value."""
-
-        if name not in self.CHANNEL_NAMES:
-            raise ValueError("'{}' is an invalid channel name".format(name))
-        return getattr(self, name)
+    @abstractmethod
+    def from_base(self, coords: Vector) -> Vector:  # pragma: no cover
+        """From base color."""
 
     def to_string(
-        self, parent, *, alpha=None, precision=None, fit=True, **kwargs
-    ):
+        self,
+        parent: Color,
+        *,
+        alpha: bool | None = None,
+        precision: int | Sequence[int] | None = None,
+        rounding: str | None = None,
+        fit: str | bool | dict[str, Any] = True,
+        none: bool = False,
+        percent: bool | Sequence[bool] = False,
+        angle: str = 'deg',
+        **kwargs: Any
+    ) -> str:
         """Convert to CSS 'color' string: `color(space coords+ / alpha)`."""
 
-        if precision is None:
-            precision = parent.PRECISION
+        return serialize.serialize_css(
+            parent,
+            color=True,
+            alpha=alpha,
+            precision=precision,
+            rounding=rounding,
+            fit=fit,
+            none=none,
+            percent=percent,
+            angle=angle
+        )
 
-        a = util.no_nan(self.alpha)
-        alpha = alpha is not False and (alpha is True or a < 1.0)
-
-        method = None if not isinstance(fit, str) else fit
-        coords = util.no_nan(parent.fit(method=method).coords() if fit else self.coords())
-        gamut = self.RANGE
-        template = "color({} {} / {})" if alpha else "color({} {})"
-
-        values = []
-        for i, coord in enumerate(coords):
-            value = util.fmt_float(coord, precision)
-            if isinstance(gamut[i][0], Percent):
-                value += '%'
-            values.append(value)
-
-        if alpha:
-            return template.format(
-                self._serialize()[0], ' '.join(values), util.fmt_float(a, max(precision, util.DEF_PREC))
-            )
-        else:
-            return template.format(self._serialize()[0], ' '.join(values))
-
-    @classmethod
-    def null_adjust(cls, coords, alpha):
-        """Process coordinates and adjust any channels to null/NaN if required."""
-
-        return coords, alpha
-
-    @classmethod
-    def match(cls, string, start=0, fullmatch=True):
+    def match(
+        self,
+        string: str,
+        start: int = 0,
+        fullmatch: bool = True
+    ) -> tuple[tuple[Vector, float], int] | None:
         """Match a color by string."""
 
-        m = cls.DEFAULT_MATCH.match(string, start)
-        if (
-            m is not None and
-            (
-                (m.group(1) and m.group(1).lower() in cls._serialize())
-            ) and (not fullmatch or m.end(0) == len(string))
-        ):
-
-            # Break channels up into a list
-            split = _parse.RE_SLASH_SPLIT.split(m.group(2).strip(), maxsplit=1)
-
-            # Get alpha channel
-            alpha = _parse.norm_alpha_channel(split[-1]) if len(split) > 1 else 1.0
-
-            # Parse color channels
-            channels = []
-            for i, c in enumerate(_parse.RE_CHAN_SPLIT.split(split[0]), 0):
-                if c and i < cls.NUM_COLOR_CHANNELS:
-                    is_percent = isinstance(cls.RANGE[i][0], Percent)
-                    is_optional_percent = isinstance(cls.RANGE[i][0], OptionalPercent)
-                    has_percent = c.endswith('%')
-                    if is_percent and not has_percent:
-                        # We have an invalid percentage channel
-                        return None, None
-                    elif (not is_percent and not is_optional_percent) and has_percent:
-                        # Percents are not allowed for this channel.
-                        return None, None
-                    channels.append(_parse.norm_color_channel(c, not is_percent))
-
-            # Missing channels are filled with zeros
-            if len(channels) < cls.NUM_COLOR_CHANNELS:
-                diff = cls.NUM_COLOR_CHANNELS - len(channels)
-                channels.extend([0.0] * diff)
-
-            # Apply null adjustments (null hues) if applicable
-            return cls.null_adjust(channels, alpha), m.end(0)
-
-        return None, None
+        return None

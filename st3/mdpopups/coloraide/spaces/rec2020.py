@@ -1,96 +1,75 @@
-"""Rec 2020 color class."""
-from ..spaces import RE_DEFAULT_MATCH
-from .srgb.base import SRGB
-from .xyz import XYZ
-from .. import util
-import re
-import math
+"""
+Rec. 2020 color space (display referred).
 
-ALPHA = 1.09929682680944
-BETA = 0.018053968510807
-BETA45 = 0.018053968510807 * 4.5
+Uses the display referred EOTF as specified in BT.1886.
+
+- https://www.itu.int/dms_pubrec/itu-r/rec/bt/R-REC-BT.2020-2-201510-I!!PDF-E.pdf
+- https://www.itu.int/dms_pubrec/itu-r/rec/bt/r-rec-bt.1886-0-201103-i!!pdf-e.pdf
+"""
+from __future__ import annotations
+from .srgb_linear import sRGBLinear
+from .. import algebra as alg
+from ..types import Vector
+
+GAMMA = 2.40
+IGAMMA = 1 / GAMMA
 
 
-def lin_2020(rgb):
+def inverse_eotf_bt1886(rgb: Vector) -> Vector:
     """
-    Convert an array of rec-2020 RGB values in the range 0.0 - 1.0 to linear light (un-corrected) form.
+    Inverse ITU-R BT.1886 EOTF.
 
-    https://en.wikipedia.org/wiki/Rec._2020#Transfer_characteristics
-    """
+    ```
+    igamma = 1 / gamma
 
-    result = []
-    for i in rgb:
-        # Mirror linear nature of algorithm on the negative axis
-        abs_i = abs(i)
-        if abs_i < BETA45:
-            result.append(i / 4.5)
-        else:
-            result.append(math.copysign(util.nth_root((abs_i + ALPHA - 1) / ALPHA, 0.45), i))
-    return result
+    d = lw ** igamma - lb ** igamma
+    a = d ** gamma
+    b = lb ** igamma / d
+    return [math.copysign(a * alg.spow(abs(l) / a, igamma) - b, l) for l in rgb]
+    ```
 
-
-def gam_2020(rgb):
-    """
-    Convert an array of linear-light rec-2020 RGB  in the range 0.0-1.0 to gamma corrected form.
-
-    https://en.wikipedia.org/wiki/Rec._2020#Transfer_characteristics
+    When using `lb == 0`, `lw == 1`, and gamma of `2.4`, this simplifies to a simple power of `1 / 2.4`.
     """
 
-    result = []
-    for i in rgb:
-        # Mirror linear nature of algorithm on the negative axis
-        abs_i = abs(i)
-        if abs_i < BETA:
-            result.append(4.5 * i)
-        else:
-            result.append(math.copysign(ALPHA * (abs_i ** 0.45) - (ALPHA - 1), i))
-    return result
+    return [alg.spow(v, IGAMMA) for v in rgb]
 
 
-def lin_2020_to_xyz(rgb):
+def eotf_bt1886(rgb: Vector) -> Vector:
     """
-    Convert an array of linear-light rec-2020 values to CIE XYZ using  D65.
+    ITU-R BT.1886 EOTF.
 
-    (no chromatic adaptation)
-    http://www.brucelindbloom.com/index.html?Eqn_RGB_XYZ_Matrix.html
+    ```
+    igamma = 1 / gamma
+
+    d = lw ** igamma - lb ** igamma
+    a = d ** gamma
+    b = lb ** igamma / d
+    return [math.copysign(a * alg.spow(max(abs(v) + b, 0), gamma), v) for v in rgb]
+    ```
+
+    When using `lb == 0`, `lw == 1`, and gamma of `2.4`, this simplifies to a simple power of `2.4`.
     """
 
-    m = [
-        [6.3701019141110093e-01, 1.4461502739696933e-01, 1.6884478119192992e-01],
-        [2.6272171736164052e-01, 6.7798927550226207e-01, 5.9289007136097520e-02],
-        [4.9945154055471928e-17, 2.8072328847646915e-02, 1.0607576711523534e+00]
-    ]
-
-    return util.dot(m, rgb)
+    return [alg.spow(v, GAMMA) for v in rgb]
 
 
-def xyz_to_lin_2020(xyz):
-    """Convert XYZ to linear-light rec-2020."""
-
-    m = [
-        [1.7165106697619734, -0.35564166998671587, -0.25334554182190716],
-        [-0.6666930011826241, 1.6165022083469103, 0.015768750389995],
-        [0.017643638767459002, -0.04277978166904461, 0.9423050727200183]
-    ]
-
-    return util.dot(m, xyz)
-
-
-class Rec2020(SRGB):
+class Rec2020(sRGBLinear):
     """Rec 2020 class."""
 
-    SPACE = "rec2020"
-    DEFAULT_MATCH = re.compile(RE_DEFAULT_MATCH.format(color_space=SPACE, channels=3))
-    WHITE = "D65"
+    BASE = "rec2020-linear"
+    NAME = "rec2020"
 
-    @classmethod
-    def _to_xyz(cls, parent, rgb):
-        """To XYZ."""
+    def linear(self) -> str:
+        """Return linear version of the RGB (if available)."""
 
-        return parent.chromatic_adaptation(cls.WHITE, XYZ.WHITE, lin_2020_to_xyz(lin_2020(rgb)))
+        return self.BASE
 
-    @classmethod
-    def _from_xyz(cls, parent, xyz):
-        """From XYZ."""
+    def to_base(self, coords: Vector) -> Vector:
+        """To XYZ from Rec. 2020."""
 
-        return gam_2020(xyz_to_lin_2020(parent.chromatic_adaptation(XYZ.WHITE, cls.WHITE, xyz)))
+        return eotf_bt1886(coords)
+
+    def from_base(self, coords: Vector) -> Vector:
+        """From XYZ to Rec. 2020."""
+
+        return inverse_eotf_bt1886(coords)

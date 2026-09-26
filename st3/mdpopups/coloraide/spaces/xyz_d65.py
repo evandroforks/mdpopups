@@ -1,32 +1,49 @@
 """XYZ D65 class."""
-from ..spaces import RE_DEFAULT_MATCH, GamutUnbound
-from .xyz import XYZ
-import re
+from __future__ import annotations
+import math
+from ..spaces import Space, RGBish
+from ..cat import WHITES
+from ..channels import Channel
+from .. import util
+from .. import algebra as alg
+from ..types import Vector
 
 
-class XYZD65(XYZ):
+class XYZD65(RGBish, Space):
     """XYZ D65 class."""
 
-    SPACE = "xyz-d65"
-    SERIALIZE = ("--xyz-d65",)
-    CHANNEL_NAMES = ("x", "y", "z", "alpha")
-    DEFAULT_MATCH = re.compile(RE_DEFAULT_MATCH.format(color_space='|'.join(SERIALIZE), channels=3))
-    WHITE = "D65"
-
-    RANGE = (
-        GamutUnbound([0.0, 1.0]),
-        GamutUnbound([0.0, 1.0]),
-        GamutUnbound([0.0, 1.0])
+    BASE = "xyz-d65"
+    NAME = "xyz-d65"
+    SERIALIZE = ("xyz-d65", 'xyz')  # type: tuple[str, ...]
+    CHANNELS = (
+        Channel("x", 0.0, 1.0),
+        Channel("y", 0.0, 1.0),
+        Channel("z", 0.0, 1.0)
     )
+    WHITE = WHITES['2deg']['D65']
 
-    @classmethod
-    def _to_xyz(cls, parent, xyzd65):
-        """To XYZ."""
+    def is_achromatic(self, coords: Vector) -> bool:
+        """Is achromatic."""
 
-        return parent.chromatic_adaptation(cls.WHITE, XYZ.WHITE, xyzd65)
+        for x in alg.vcross(coords, util.xy_to_xyz(self.white())):
+            if not math.isclose(0.0, x, abs_tol=util.ACHROMATIC_THRESHOLD_SM):
+                return False
+        return True
 
-    @classmethod
-    def _from_xyz(cls, parent, xyz):
-        """From XYZ."""
+    def to_base(self, coords: Vector) -> Vector:
+        """
+        To XYZ (no change).
 
-        return parent.chromatic_adaptation(XYZ.WHITE, cls.WHITE, xyz)
+        Any needed chromatic adaptation is handled in the parent Color object.
+        """
+
+        return coords
+
+    def from_base(self, coords: Vector) -> Vector:
+        """
+        From XYZ (no change).
+
+        Any needed chromatic adaptation is handled in the parent Color object.
+        """
+
+        return coords

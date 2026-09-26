@@ -9,24 +9,32 @@ TextMate theme to CSS.
 https://manual.macromates.com/en/language_grammars#naming_conventions
 """
 import sublime
+import sublime_api
 from . import markdown
+from . import marko
 from . import jinja2
+from .markdown.core import logger
 import traceback
 import time
 import codecs
 import html
 import html.parser
+import sys
 import urllib
 import functools
 import base64
 from . import version as ver
 from . import colorbox
+from importlib import import_module
 from collections import OrderedDict
 from .st_scheme_template import SchemeTemplate, POPUP, PHANTOM, SHEET
 from .st_clean_css import clean_css
 from .st_pygments_highlight import syntax_hl as pyg_syntax_hl
 from .st_code_highlight import SublimeHighlight
+from .mdx.marko_highlight import make_extension
+from .mdx.marko_gfm import GFM
 from .st_mapping import lang_map
+from .coloraide import Color
 from . import imagetint
 import re
 import os
@@ -35,8 +43,6 @@ try:
     import bs4
 except Exception:
     bs4 = None
-
-HTML_SHEET_SUPPORT = int(sublime.version()) >= 4074
 
 LOCATION = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_CSS_PATH = os.path.join(LOCATION, 'css', 'default.css')
@@ -106,6 +112,12 @@ def _can_show(view, location=-1):
         can_show = False
 
     return can_show
+
+
+if sys.version_info < (3, 4):
+    _unescape_html = html.parser.HTMLParser().unescape
+else:
+    _unescape_html = html.unescape
 
 
 ##############################
@@ -269,15 +281,14 @@ class _MdWrapper(markdown.Markdown):
 
         """
 
-        from .markdown import util
         from .markdown.extensions import Extension
 
         for ext in extensions:
             try:
-                if isinstance(ext, util.string_type):
+                if isinstance(ext, str):
                     ext = self.build_extension(ext, configs.get(ext, {}))
                 if isinstance(ext, Extension):
-                    ext._extendMarkdown(self)
+                    ext.extendMarkdown(self)
                 elif ext is not None:
                     raise TypeError(
                         'Extension "{}.{}" must be of type: "markdown.Extension"'.format(
@@ -290,6 +301,144 @@ class _MdWrapper(markdown.Markdown):
                 _debug(traceback.format_exc(), ERROR)
 
         return self
+
+    def build_extension(self, ext_name, configs):
+        """
+        Build extension from a string name, then return an instance using the given `configs`.
+
+        Arguments:
+            ext_name: Name of extension as a string.
+            configs: Configuration settings for extension.
+
+        Returns:
+            An instance of the extension with the given configuration settings.
+
+        First attempt to load an entry point. The string name must be registered as an entry point in the
+        `markdown.extensions` group which points to a subclass of the [`markdown.extensions.Extension`][] class.
+        If multiple distributions have registered the same name, the first one found is returned.
+
+        If no entry point is found, assume dot notation (`path.to.module:ClassName`). Load the specified class and
+        return an instance. If no class is specified, import the module and call a `makeExtension` function and return
+        the [`markdown.extensions.Extension`][] instance returned by that function.
+        """
+        configs = dict(configs)
+
+        # Get class name (if provided): `path.to.module:ClassName`
+        ext_name, class_name = ext_name.split(':', 1) if ':' in ext_name else (ext_name, '')
+
+        try:
+            if ext_name.startswith('markdown.extensions.'):
+                ext_name = ext_name.replace('markdown.extensions.', 'mdpopups.markdown.extensions.', 1)
+            if ext_name.startswith('pymdownx.'):
+                ext_name = ext_name.replace('pymdownx.', 'mdpopups.pymdownx.', 1)
+            module = import_module(ext_name)
+            logger.debug(
+                'Successfully imported extension module "%s".' % ext_name
+            )
+        except ImportError as e:
+            message = 'Failed loading extension "%s".' % ext_name
+            e.args = (message,) + e.args[1:]
+            raise
+
+        if class_name:
+            # Load given class name from module.
+            return getattr(module, class_name)(**configs)
+        else:
+            # Expect  `makeExtension()` function to return a class.
+            try:
+                return module.makeExtension(**configs)
+            except AttributeError as e:
+                message = e.args[0]
+                message = "Failed to initiate extension " \
+                          "'%s': %s" % (ext_name, message)
+                e.args = (message,) + e.args[1:]
+                raise
+
+
+class MarkoHTMLRenderer(marko.HTMLRenderer):
+    """HTML renderer adjusted for Sublime text."""
+
+    def render_list_item(self, element):
+        """Don't insert newlines right after `<li>` tag as Sublime won't render it quite right."""
+
+        return f"<li>{self.render_children(element)}</li>\n"
+
+
+class _MarkoWrapper(marko.Markdown):
+    """Marko wrapper."""
+
+    def __init__(self, *args, **kwargs):
+        """Initialize."""
+
+        if 'allow_code_wrap' in kwargs:
+            self.sublime_wrap = kwargs['allow_code_wrap']
+            del kwargs['allow_code_wrap']
+        if 'language_map' in kwargs:
+            self.sublime_map = kwargs['language_map']
+            del kwargs['language_map']
+        if 'sublime_hl' in kwargs:
+            self.sublime_hl = kwargs['sublime_hl']
+            del kwargs['sublime_hl']
+
+        kwargs['renderer'] = MarkoHTMLRenderer
+        kwargs['extensions'][0] = make_extension(self.sublime_hl, self.sublime_wrap, self.sublime_map)
+        try:
+            idx = kwargs['extensions'].index('gfm')
+            kwargs['extensions'][idx] = GFM
+        except ValueError:
+            pass
+        super().__init__(*args, **kwargs)
+
+    def load_extension(self, name, **kwargs):
+        """
+        Load extension object from a string.
+
+        First try `marko.ext.<name>` if possible.
+        """
+        module = None
+        if "." not in name:
+            try:
+                module = import_module(f"mdpopups.marko.ext.{name}")
+            except ImportError:
+                pass
+        if module is None:
+            if not name.startswith('mdpopups.'):
+                name = 'mdpopups.' + name
+            try:
+                module = import_module(name)
+            except ImportError as e:
+                raise ImportError(f"Extension {name} cannot be imported") from e
+
+        try:
+            return module.make_extension(**kwargs)
+        except AttributeError:
+            raise AttributeError(
+                f"Module {name} does not have 'make_extension' attributte."
+            ) from None
+
+    def use(self, *extensions):
+        r"""
+        Register extensions to Markdown object.
+
+        An extension should be either an object providing ``elements``, `parser_mixins``
+        , ``renderer_mixins`` or all attributes, or a string representing the
+        corresponding extension in ``marko.ext`` module.
+
+        :param \*extensions: string or :class:`marko.helpers.MarkoExtension` object.
+
+        .. note:: Marko uses a mixin based extension system, the order of extensions
+            matters: An extension preceding in order will have higher priority.
+        """
+
+        if self._setup_done:
+            raise marko.SetupDone()
+        for extension in extensions:
+            if isinstance(extension, str):
+                extension = self.load_extension(extension)
+
+            self._parser_mixins = extension.parser_mixins + self._parser_mixins
+            self._renderer_mixins = extension.renderer_mixins + self._renderer_mixins
+            self._extra_elements.extend(extension.elements)
 
 
 def _get_theme(view, css=None, css_type=POPUP, template_vars=None):
@@ -314,11 +463,9 @@ def _get_theme(view, css=None, css_type=POPUP, template_vars=None):
 def _remove_entities(text):
     """Remove unsupported HTML entities."""
 
-    p = html.parser.HTMLParser()
-
     def repl(m):
         """Replace entities except &, <, >, and `nbsp`."""
-        return p.unescape(m.group(1))
+        return _unescape_html(m.group(1))
 
     return RE_BAD_ENTITIES.sub(repl, text)
 
@@ -400,76 +547,102 @@ def md2html(
 
     fm, markup = frontmatter.get_frontmatter(markup)
 
-    # We always include these
-    extensions = [
-        "mdpopups.mdx.highlight",
-        "pymdownx.inlinehilite",
-        "pymdownx.superfences"
-    ]
+    parser = fm.get('markdown_parser', 'markdown')
+    if parser == 'markdown':
 
-    configs = {
-        "mdpopups.mdx.highlight": {
-            "guess_lang": False
-        },
-        "pymdownx.inlinehilite": {
-            "style_plain_text": True
-        },
-        "pymdownx.superfences": {
-            "custom_fences": fm.get('custom_fences', [])
+        # We always include these
+        extensions = [
+            "mdpopups.mdx.highlight",
+            "pymdownx.inlinehilite",
+            "pymdownx.superfences"
+        ]
+
+        configs = {
+            "mdpopups.mdx.highlight": {
+                "guess_lang": False
+            },
+            "pymdownx.inlinehilite": {
+                "style_plain_text": True
+            },
+            "pymdownx.superfences": {
+                "custom_fences": fm.get('custom_fences', [])
+            }
         }
-    }
 
-    # Check if plugin is overriding extensions
-    md_exts = fm.get('markdown_extensions', None)
-    if md_exts is None:
-        # No extension override, use defaults
-        extensions.extend(
-            [
-                "markdown.extensions.admonition",
-                "markdown.extensions.attr_list",
-                "markdown.extensions.def_list",
-                "pymdownx.betterem",
-                "pymdownx.magiclink",
-                "markdown.extensions.md_in_html",
-                "markdown.extensions.nl2br"
-            ]
-        )
-    else:
-        for ext in md_exts:
-            if isinstance(ext, (dict, OrderedDict)):
-                k, v = next(iter(ext.items()))
-                # We don't allow plugins to overrides the internal color
-                if not k.startswith('mdpopups.'):
-                    if k == "pymdownx.extrarawhtml":
-                        k = 'markdown.extensions.md_in_html'
-                        _debug(
-                            "Warning: 'pymdownx.extrarawhtml' no longer exists. 'markdown.extensions.md_in_html'"
-                            " will be used instead. Plugins should migrate as mdpopups will not redirect in the "
-                            "future.",
-                            WARNING
-                        )
-                    extensions.append(k)
-                    if v is not None:
-                        configs[k] = v
-            elif isinstance(ext, str):
-                if not ext.startswith('mdpopups.'):
-                    if ext == "pymdownx.extrarawhtml":
-                        ext = 'markdown.extensions.md_in_html'
-                        _debug(
-                            "Warning: 'pymdownx.extrarawhtml' no longer exists. 'markdown.extensions.md_in_html'"
-                            " will be used instead. Plugins should migrate as mdpopups will not redirect in the"
-                            " future.",
-                            WARNING
-                        )
-                    extensions.append(ext)
+        # Check if plugin is overriding extensions
+        md_exts = fm.get('markdown_extensions', None)
+        if md_exts is None:
+            # No extension override, use defaults
+            extensions.extend(
+                [
+                    "markdown.extensions.admonition",
+                    "markdown.extensions.attr_list",
+                    "markdown.extensions.def_list",
+                    "pymdownx.betterem",
+                    "pymdownx.magiclink",
+                    "markdown.extensions.md_in_html",
+                    "markdown.extensions.nl2br"
+                ]
+            )
+        else:
+            for ext in md_exts:
+                if isinstance(ext, (dict, OrderedDict)):
+                    k, v = next(iter(ext.items()))
+                    # We don't allow plugins to overrides the internal color
+                    if not k.startswith('mdpopups.'):
+                        if k == "pymdownx.extrarawhtml":
+                            k = 'markdown.extensions.md_in_html'
+                            _debug(
+                                "Warning: 'pymdownx.extrarawhtml' no longer exists. 'markdown.extensions.md_in_html'"
+                                " will be used instead. Plugins should migrate as mdpopups will not redirect in the "
+                                "future.",
+                                WARNING
+                            )
+                        extensions.append(k)
+                        if v is not None:
+                            configs[k] = v
+                elif isinstance(ext, str):
+                    if not ext.startswith('mdpopups.'):
+                        if ext == "pymdownx.extrarawhtml":
+                            ext = 'markdown.extensions.md_in_html'
+                            _debug(
+                                "Warning: 'pymdownx.extrarawhtml' no longer exists. 'markdown.extensions.md_in_html'"
+                                " will be used instead. Plugins should migrate as mdpopups will not redirect in the"
+                                " future.",
+                                WARNING
+                            )
+                        extensions.append(ext)
 
-    return _MdWrapper(
-        extensions=extensions,
-        extension_configs=configs,
-        sublime_hl=sublime_hl,
-        allow_code_wrap=fm.get('allow_code_wrap', False),
-        language_map=fm.get('language_map', {})
-    ).convert(_markup_template(markup, template_vars, template_env_options)).replace('&quot;', '"')
+        return _MdWrapper(
+            extensions=extensions,
+            extension_configs=configs,
+            sublime_hl=sublime_hl,
+            allow_code_wrap=fm.get('allow_code_wrap', False),
+            language_map=fm.get('language_map', {})
+        ).convert(_markup_template(markup, template_vars, template_env_options))
+    elif parser == 'marko':
+        extensions = ["mdx.marko_highlight"]
+        md_exts = fm.get('markdown_extensions')
+        if md_exts is not None:
+            for ext in md_exts:
+                if isinstance(ext, (dict, OrderedDict)):
+                    k, v = next(iter(ext.items()))
+                    # We don't allow plugins to overrides the internal color
+                    if not k.startswith('mdpopups.'):
+                        extensions.append(k)
+                elif isinstance(ext, str):
+                    if not ext.startswith('mdpopups.'):
+                        extensions.append(ext)
+        return _MarkoWrapper(
+            extensions=extensions,
+            sublime_hl=sublime_hl[1],
+            allow_code_wrap=fm.get('allow_code_wrap', False),
+            language_map=fm.get('language_map', {})
+        ).convert(_markup_template(markup, template_vars, template_env_options))
+
+    # No parser found
+    _log(f'Unknown parser: {parser}')
+    return ''
 
 
 def color_box(
@@ -479,7 +652,7 @@ def color_box(
     """Color box."""
 
     return colorbox.color_box(
-        colors, border, border2, height, width,
+        [Color(c) for c in colors], Color(border), border2, height, width,
         border_size, check_size, max_colors, alpha, border_map
     )
 
@@ -491,7 +664,7 @@ def color_box_raw(
     """Color box raw."""
 
     return colorbox.color_box_raw(
-        colors, border, border2, height, width,
+        [Color(c) for c in colors], Color(border), border2, height, width,
         border_size, check_size, max_colors, alpha, border_map
     )
 
@@ -715,44 +888,49 @@ def query_phantoms(view, pids):
     return view.query_phantoms(pids)
 
 
-if HTML_SHEET_SUPPORT:
-    def new_html_sheet(
-        window, name, contents, md=True, css=None, flags=0, group=-1,
-        wrapper_class=None, template_vars=None, template_env_options=None, **kwargs
-    ):
-        """Create new HTML sheet."""
+def new_html_sheet(
+    window, name, contents, md=True, css=None, flags=0, group=-1,
+    wrapper_class=None, template_vars=None, template_env_options=None, **kwargs
+):
+    """Create new HTML sheet."""
 
-        view = window.create_output_panel('mdpopups-dummy', unlisted=True)
-        try:
-            html = _create_html(
-                view, contents, md, css, css_type=SHEET, wrapper_class=wrapper_class,
-                template_vars=template_vars, template_env_options=template_env_options
-            )
-        except Exception:
-            _log(traceback.format_exc())
-            html = IDK
+    view = window.create_output_panel('mdpopups-dummy', unlisted=True)
+    try:
+        html = _create_html(
+            view, contents, md, css, css_type=SHEET, wrapper_class=wrapper_class,
+            template_vars=template_vars, template_env_options=template_env_options
+        )
+    except Exception:
+        _log(traceback.format_exc())
+        html = IDK
 
-        return window.new_html_sheet(name, html, flags, group)
+    return window.new_html_sheet(name, html, flags, group)
 
-    def update_html_sheet(
-        sheet, contents, md=True, css=None, wrapper_class=None,
-        template_vars=None, template_env_options=None, **kwargs
-    ):
-        """Update an HTML sheet."""
 
-        window = sheet.window()
-        view = window.create_output_panel('mdpopups-dummy', unlisted=True)
+def update_html_sheet(
+    sheet, contents, md=True, css=None, wrapper_class=None,
+    template_vars=None, template_env_options=None, **kwargs
+):
+    """Update an HTML sheet."""
 
-        try:
-            html = _create_html(
-                view, contents, md, css, css_type=SHEET, wrapper_class=wrapper_class,
-                template_vars=template_vars, template_env_options=template_env_options
-            )
-        except Exception:
-            _log(traceback.format_exc())
-            html = IDK
+    window = sheet.window()
 
-        sheet.set_contents(html)
+    # Probably a transient sheet, just get a window
+    if window is None:
+        window = sublime.active_window()
+
+    view = window.create_output_panel('mdpopups-dummy', unlisted=True)
+
+    try:
+        html = _create_html(
+            view, contents, md, css, css_type=SHEET, wrapper_class=wrapper_class,
+            template_vars=template_vars, template_env_options=template_env_options
+        )
+    except Exception:
+        _log(traceback.format_exc())
+        html = IDK
+
+    sublime_api.html_sheet_set_contents(sheet.id(), html)
 
 
 class Phantom(sublime.Phantom):
@@ -887,7 +1065,7 @@ def _image_parser(text):
         m2 = RE_TAG_LINK_ATTR.search(m.group('attr'))
         if m2:
             src = m2.group('path')[1:-1]
-            src = html.parser.HTMLParser().unescape(src)
+            src = _unescape_html(src)
             if urllib.parse.urlparse(src).scheme in ("http", "https"):
                 s = start + m2.start('path') + 1
                 e = start + m2.end('path') - 1

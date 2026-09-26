@@ -1,146 +1,115 @@
 """HSV class."""
-from ..spaces import Space, RE_DEFAULT_MATCH, Angle, Percent, GamutBound, Cylindrical
-from .srgb.base import SRGB
-from .hsl.base import HSL
+from __future__ import annotations
+from .. import algebra as alg
+from ..spaces import Space, HSVish
+from ..cat import WHITES
+from ..channels import Channel, FLG_ANGLE
 from .. import util
-import re
+from ..types import Vector
+from typing import Any
 
 
-def hsv_to_hsl(hsv):
+def hsv_to_srgb(hsv: Vector) -> Vector:
     """
-    HSV to HSL.
+    Convert HSV to sRGB.
 
-    https://en.wikipedia.org/wiki/HSL_and_HSV#Interconversion
+    https://en.wikipedia.org/wiki/HSL_and_HSV#HSV_to_RGB_alternative
     """
 
     h, s, v = hsv
-    s /= 100.0
-    v /= 100.0
-    l = v * (1.0 - s / 2.0)
-    s = 0.0 if (l == 0.0 or l == 1.0) else ((v - l) / min(l, 1.0 - l)) * 100
+    h = util.constrain_hue(h) / 60
 
-    if s == 0:
-        h = util.NaN
+    def f(n: int) -> float:
+        """Calculate the channels."""
 
-    return [
-        util.constrain_hue(h),
-        s,
-        l * 100
-    ]
+        k = (n + h) % 6
+        return v - v * s * max(0, min([k, 4 - k, 1]))
+
+    return [f(5), f(3), f(1)]
 
 
-def hsl_to_hsv(hsl):
+def srgb_to_hsv(rgb: Vector) -> Vector:
     """
-    HSL to HSV.
+    Convert sRGB to HSV.
 
-    https://en.wikipedia.org/wiki/HSL_and_HSV#Interconversion
+    https://en.wikipedia.org/wiki/HSL_and_HSV#Hue_and_chroma
+    https://en.wikipedia.org/wiki/HSL_and_HSV#Saturation
+    https://en.wikipedia.org/wiki/HSL_and_HSV#Lightness
     """
 
-    h, s, l = hsl
-    s /= 100.0
-    l /= 100.0
+    r, g, b = rgb
+    v = max(rgb)
+    mn = min(rgb)
+    h = 0.0
+    s = 0.0
+    c = v - mn
 
-    v = l + s * min(l, 1.0 - l)
-    s = 0.0 if (v == 0.0) else 2 * (1.0 - l / v)
+    if c != 0.0:
+        if v == r:
+            h = (g - b) / c
+        elif v == g:
+            h = (b - r) / c + 2.0
+        else:
+            h = (r - g) / c + 4.0
+        h *= 60.0
 
-    if s == 0:
-        h = util.NaN
+    if v:
+        s = c / v
 
-    return [util.constrain_hue(h), s * 100.0, v * 100.0]
+    return [util.constrain_hue(h), s, v]
 
 
-class HSV(Cylindrical, Space):
+class HSV(HSVish, Space):
     """HSL class."""
 
-    SPACE = "hsv"
+    BASE = "srgb"
+    NAME = "hsv"
     SERIALIZE = ("--hsv",)
-    CHANNEL_NAMES = ("hue", "saturation", "value", "alpha")
-    DEFAULT_MATCH = re.compile(RE_DEFAULT_MATCH.format(color_space='|'.join(SERIALIZE), channels=3))
-    GAMUT_CHECK = "srgb"
-    WHITE = "D65"
-
-    RANGE = (
-        GamutBound([Angle(0.0), Angle(360.0)]),
-        GamutBound([Percent(0.0), Percent(100.0)]),
-        GamutBound([Percent(0.0), Percent(100.0)])
+    CHANNELS = (
+        Channel("h", flags=FLG_ANGLE),
+        Channel("s", 0.0, 1.0, bound=True),
+        Channel("v", 0.0, 1.0, bound=True)
     )
+    CHANNEL_ALIASES = {
+        "hue": "h",
+        "saturation": "s",
+        "value": "v"
+    }
+    GAMUT_CHECK = "srgb"  # type: str | None
+    CLIP_SPACE = "hsv"  # type: str | None
+    WHITE = WHITES['2deg']['D65']
 
-    @property
-    def hue(self):
-        """Hue channel."""
+    def __init__(self, **kwargs: Any):
+        """Initialize."""
 
-        return self._coords[0]
+        super().__init__(**kwargs)
+        order = alg.order(round(self.channels[self.indexes()[2]].high, 5))
+        self.achromatic_threshold = (1 * 10.0 ** order) / 1_000_000
 
-    @hue.setter
-    def hue(self, value):
-        """Shift the hue."""
+    def lightness_name(self) -> str:
+        """Get lightness name."""
 
-        self._coords[0] = self._handle_input(value)
+        return "v"
 
-    @property
-    def saturation(self):
-        """Saturation channel."""
+    def normalize(self, coords: Vector) -> Vector:
+        """Normalize coordinates."""
 
-        return self._coords[1]
+        if coords[1] < 0:
+            return self.from_base(self.to_base(coords))
+        coords[0] %= 360.0
+        return coords
 
-    @saturation.setter
-    def saturation(self, value):
-        """Saturate or unsaturate the color by the given factor."""
+    def is_achromatic(self, coords: Vector) -> bool:
+        """Check if color is achromatic."""
 
-        self._coords[1] = self._handle_input(value)
+        return abs(coords[1]) < self.achromatic_threshold or coords[2] == 0.0
 
-    @property
-    def value(self):
-        """Value channel."""
+    def to_base(self, coords: Vector) -> Vector:
+        """To HSL from HSV."""
 
-        return self._coords[2]
+        return hsv_to_srgb(coords)
 
-    @value.setter
-    def value(self, value):
-        """Set value channel."""
+    def from_base(self, coords: Vector) -> Vector:
+        """From HSL to HSV."""
 
-        self._coords[2] = self._handle_input(value)
-
-    @classmethod
-    def null_adjust(cls, coords, alpha):
-        """On color update."""
-
-        if coords[1] == 0:
-            coords[0] = util.NaN
-        return coords, alpha
-
-    @classmethod
-    def _to_xyz(cls, parent, hsv):
-        """To XYZ."""
-
-        return SRGB._to_xyz(parent, cls._to_srgb(parent, hsv))
-
-    @classmethod
-    def _from_xyz(cls, parent, xyz):
-        """From XYZ."""
-
-        return cls._from_srgb(parent, SRGB._from_xyz(parent, xyz))
-
-    @classmethod
-    def _to_hsl(cls, parent, hsv):
-        """To HSL."""
-
-        return hsv_to_hsl(hsv)
-
-    @classmethod
-    def _from_hsl(cls, parent, hsl):
-        """From HSL."""
-
-        return hsl_to_hsv(hsl)
-
-    @classmethod
-    def _to_srgb(cls, parent, hsv):
-        """To sRGB."""
-
-        return HSL._to_srgb(parent, cls._to_hsl(parent, hsv))
-
-    @classmethod
-    def _from_srgb(cls, parent, rgb):
-        """From sRGB."""
-
-        return cls._from_hsl(parent, HSL._from_srgb(parent, rgb))
+        return srgb_to_hsv(coords)
